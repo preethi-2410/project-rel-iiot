@@ -7,6 +7,8 @@ from tqdm import tqdm
 
 from src.data.loader import DataManager
 from src.federated.node import EdgeNode
+from src.federated.peer_exchange import PeerExchange
+from src.evaluation.metrics import MetricsCalculator
 
 class FederatedSimulation:
     def __init__(self, 
@@ -15,11 +17,19 @@ class FederatedSimulation:
                  connectivity: str = 'ring', # ring, full, random
                  connectivity_prob: float = 0.5, # for random
                  mode: str = 'decentralized', # decentralized, centralized, local
-                 device: str = 'cpu'):
+                 device: str = 'cpu',
+                 participation_rate: float = 1.0,
+                 drop_rate: float = 0.0,
+                 use_dp: bool = False,
+                 dp_epsilon: float = 1.0,
+                 use_defense: bool = False):
         
         self.num_nodes = num_nodes
         self.mode = mode
         self.device = device
+        self.participation_rate = participation_rate
+        self.network = PeerExchange(drop_rate=drop_rate)
+        
         self.nodes: List[EdgeNode] = []
         self.adjacency_matrix = None
         
@@ -42,7 +52,9 @@ class FederatedSimulation:
         input_dim = X_train.shape[2]
         
         for i in range(num_nodes):
-            node = EdgeNode(node_id=i, input_dim=input_dim, device=device)
+            node = EdgeNode(node_id=i, input_dim=input_dim, device=device,
+                            use_dp=use_dp, dp_epsilon=dp_epsilon, use_defense=use_defense,
+                            seq_len=self.data_manager.window_size, stride=self.data_manager.stride)
             
             node_train_x = X_train[train_shards[i]]
             node_test_x = X_test[test_shards[i]]
@@ -76,38 +88,65 @@ class FederatedSimulation:
             
         self.adjacency_matrix = nx.to_numpy_array(G)
         
-    def run_rounds(self, rounds: int = 10, epochs_per_round: int = 1):
+    def run_rounds(self, rounds: int = 10, epochs_per_round: int = 1, callback=None):
         history = []
         
         for r in tqdm(range(rounds), desc=f"Federated Rounds ({self.mode})"):
             round_metrics = {'round': r}
+            import time
+            t_start = time.time()
+            
+            # Determine active nodes
+            num_active = max(1, int(self.num_nodes * self.participation_rate))
+            active_indices = np.random.choice(self.num_nodes, num_active, replace=False)
             
             # 1. Local Training
             losses = []
-            for node in self.nodes:
+            for i in active_indices:
+                node = self.nodes[i]
                 loss = node.train_local(epochs=epochs_per_round)
                 losses.append(loss)
             
             # 2. Communication & Aggregation
-            all_params = [node.get_parameters() for node in self.nodes]
+            # Get params from active nodes
+            active_params_map = {i: self.nodes[i].get_parameters() for i in active_indices}
             
             if self.mode == 'decentralized':
-                for i, node in enumerate(self.nodes):
+                for i in active_indices:
+                    node = self.nodes[i]
                     neighbors = np.where(self.adjacency_matrix[i] == 1)[0]
-                    neighbor_params = [all_params[n] for n in neighbors]
-                    node.aggregate_peers(neighbor_params)
+                    
+                    # Only receive from active neighbors
+                    active_neighbors = [n for n in neighbors if n in active_indices]
+                    
+                    # Simulate Network (Loss/Latency)
+                    received_params = []
+                    weights = []
+                    for n_idx in active_neighbors:
+                        param = active_params_map[n_idx]
+                        # Simulate sending
+                        latency = self.network.sample_latency()
+                        received = self.network.send(param)
+                        if received is not None:
+                            received_params.append(received)
+                            weights.append(self.network.staleness_weight(latency))
+                            
+                    node.aggregate_peers(received_params, weights if len(weights) > 0 else None)
                     
             elif self.mode == 'centralized':
-                # Average all params
-                avg_params = copy.deepcopy(all_params[0])
-                for key in avg_params.keys():
-                    for i in range(1, self.num_nodes):
-                        avg_params[key] += all_params[i][key]
-                    avg_params[key] /= self.num_nodes
-                
-                # Broadcast back
-                for node in self.nodes:
-                    node.set_parameters(avg_params)
+                # Average all active params
+                if len(active_params_map) > 0:
+                    keys = list(active_params_map.keys())
+                    avg_params = copy.deepcopy(active_params_map[keys[0]])
+                    
+                    for key in avg_params.keys():
+                        for i in keys[1:]:
+                            avg_params[key] += active_params_map[i][key]
+                        avg_params[key] = torch.div(avg_params[key], len(keys))
+                    
+                    # Broadcast back
+                    for node in self.nodes:
+                        node.set_parameters(avg_params)
             
             # For 'local', do nothing
             
@@ -126,13 +165,22 @@ class FederatedSimulation:
             avg_f1 = np.mean([m['f1'] for m in node_metrics_list])
             avg_prec = np.mean([m['precision'] for m in node_metrics_list])
             avg_rec = np.mean([m['recall'] for m in node_metrics_list])
+            avg_latency = np.mean([m.get('latency', 0.0) for m in node_metrics_list])
             
             round_metrics['f1'] = avg_f1
             round_metrics['precision'] = avg_prec
             round_metrics['recall'] = avg_rec
             round_metrics['train_loss'] = np.mean(losses)
+            round_metrics['latency'] = avg_latency
+            round_metrics['overhead_kb'] = self.get_communication_overhead()
+            model_states = [n.model.state_dict() for n in self.nodes]
+            round_metrics['divergence'] = MetricsCalculator.compute_model_divergence(model_states)
             
             history.append(round_metrics)
+
+            if callback:
+                callback(self, r)
+            round_metrics['round_time_s'] = time.time() - t_start
             
         return history
 

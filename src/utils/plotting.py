@@ -52,6 +52,26 @@ def plot_scalability(data: pd.DataFrame, save_path: str):
     plt.savefig(os.path.join(save_path, 'scalability.png'))
     plt.close()
 
+def plot_scalability_heatmap(summary_df: pd.DataFrame, save_path: str):
+    """
+    Plots heatmap of F1 score for Nodes vs Peers (averaged over epochs or for specific epoch).
+    """
+    set_style()
+    
+    # Pivot for heatmap: Nodes vs Peers
+    # We might have multiple entries for same (nodes, peers) due to different epochs.
+    # Let's average them for the heatmap or pick one.
+    pivot_table = summary_df.pivot_table(index='nodes', columns='peers', values='f1', aggfunc='mean')
+    
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(pivot_table, annot=True, cmap='viridis', fmt='.3f')
+    plt.title('Scalability Heatmap (Avg F1 Score)')
+    plt.xlabel('Peers (Connectivity)')
+    plt.ylabel('Number of Nodes')
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_path, 'scalability_heatmap.png'))
+    plt.close()
+
 def plot_explainability_stability(stability_scores: List[float], save_path: str):
     set_style()
     plt.figure(figsize=(8, 5))

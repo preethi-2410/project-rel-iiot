@@ -98,13 +98,95 @@ class DataManager:
         return X_train, X_test, y_test, y_train
 
     def _load_cmapss(self):
-        # Placeholder for C-MAPSS
-        # In a real scenario, this would load from files
-        # For now, fallback to synthetic or raise warning
-        print("Warning: C-MAPSS data not found. Returning synthetic data.")
-        return self._load_synthetic()
+        from .cmapss import CMapssLoader
+        try:
+            loader = CMapssLoader()
+            train_df, test_df, rul_df = loader.load()
+        except Exception:
+            return self._load_synthetic()
+
+        feature_cols = [c for c in train_df.columns if c.startswith('setting_') or c.startswith('s_')]
+
+        train_windows_list = []
+        train_labels_list = []
+        test_windows_list = []
+        test_labels_list = []
+
+        units = train_df['unit_nr'].unique()
+        flat_train = []
+        for u in units:
+            seq = train_df[train_df['unit_nr'] == u].sort_values('time_cycles')
+            data_u = seq[feature_cols].values
+            max_len = len(data_u)
+            healthy_end = int(max_len * 0.7)
+            flat_train.append(data_u[:healthy_end])
+
+        if len(flat_train) == 0:
+            return self._load_synthetic()
+
+        self.scaler.fit(np.concatenate(flat_train, axis=0))
+
+        for u in units:
+            seq = train_df[train_df['unit_nr'] == u].sort_values('time_cycles')
+            data_u = seq[feature_cols].values
+            max_len = len(data_u)
+            healthy_end = int(max_len * 0.7)
+            d_scaled = self.scaler.transform(data_u[:healthy_end])
+            l = np.zeros(len(d_scaled))
+            w, l_w = self._create_windows(d_scaled, l)
+            if len(w) > 0:
+                train_windows_list.append(w)
+                train_labels_list.append(l_w)
+
+        test_units = test_df['unit_nr'].unique()
+        for idx, u in enumerate(test_units):
+            seq = test_df[test_df['unit_nr'] == u].sort_values('time_cycles')
+            data_u = seq[feature_cols].values
+            d_scaled = self.scaler.transform(data_u)
+            max_len = len(d_scaled)
+            anomaly_start = int(max_len * 0.8)
+            labels_u = np.zeros(max_len)
+            if anomaly_start < max_len:
+                labels_u[anomaly_start:] = 1
+            w, l_w = self._create_windows(d_scaled, labels_u)
+            if len(w) > 0:
+                test_windows_list.append(w)
+                test_labels_list.append(l_w)
+
+        X_train = np.concatenate(train_windows_list, axis=0) if len(train_windows_list) > 0 else np.empty((0, self.window_size, len(feature_cols)))
+        y_train = np.concatenate(train_labels_list, axis=0) if len(train_labels_list) > 0 else np.empty((0,))
+        X_test = np.concatenate(test_windows_list, axis=0) if len(test_windows_list) > 0 else np.empty((0, self.window_size, len(feature_cols)))
+        y_test = np.concatenate(test_labels_list, axis=0) if len(test_labels_list) > 0 else np.empty((0,))
+
+        return X_train, X_test, y_test, y_train
 
     def _load_secom(self):
-        # Placeholder for SECOM
-        print("Warning: SECOM data not found. Returning synthetic data.")
-        return self._load_synthetic()
+        from .secom import SecomLoader
+        try:
+            loader = SecomLoader()
+            data_df, labels_df = loader.load()
+        except Exception:
+            return self._load_synthetic()
+
+        labels = labels_df.iloc[:, 0].values
+        labels = np.where(labels == -1, 0, 1)
+
+        data = data_df.values
+
+        healthy_mask = labels == 0
+        train_data = data[healthy_mask]
+
+        if train_data.shape[0] == 0:
+            return self._load_synthetic()
+
+        self.scaler.fit(train_data)
+
+        d_train = self.scaler.transform(train_data)
+        l_train = np.zeros(d_train.shape[0])
+
+        X_train, y_train = self._create_windows(d_train, l_train)
+
+        d_test = self.scaler.transform(data)
+        X_test, y_test = self._create_windows(d_test, labels[:d_test.shape[0]])
+
+        return X_train, X_test, y_test, y_train

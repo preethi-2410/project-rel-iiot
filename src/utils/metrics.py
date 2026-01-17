@@ -1,13 +1,15 @@
 import numpy as np
-from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+from sklearn.metrics import precision_recall_fscore_support
 
-def calculate_metrics(y_true, y_pred):
+def get_threshold(losses: np.ndarray, k: float = 3.0) -> float:
+    mean = np.mean(losses)
+    std = np.std(losses)
+    return mean + k * std
+
+def calculate_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='binary', zero_division=0)
     return {
         'precision': precision,
         'recall': recall,
         'f1': f1
     }
-
-def get_threshold(losses: np.ndarray, k: float = 3.0) -> float:
-    return np.mean(losses) + k * np.std(losses)

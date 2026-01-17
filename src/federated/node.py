@@ -9,12 +9,17 @@ from typing import List, Dict, Tuple
 from src.models.lstm_ae import LSTMAutoencoder
 from src.explainability.engine import ExplainabilityEngine
 from src.utils.metrics import get_threshold, calculate_metrics
+from src.security.dp import DifferentialPrivacy
+from src.security.poisoning_filter import PoisoningDefense
+from src.evaluation.metrics import MetricsCalculator
 
 class EdgeNode:
-    def __init__(self, node_id: int, input_dim: int, device: str = 'cpu'):
+    def __init__(self, node_id: int, input_dim: int, device: str = 'cpu', 
+                 use_dp: bool = False, dp_epsilon: float = 1.0,
+                 use_defense: bool = False, seq_len: int = 50, stride: int = 1):
         self.node_id = node_id
         self.device = device
-        self.model = LSTMAutoencoder(input_dim=input_dim).to(device)
+        self.model = LSTMAutoencoder(input_dim=input_dim, seq_len=seq_len).to(device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
         self.criterion = nn.MSELoss()
         
@@ -25,6 +30,13 @@ class EdgeNode:
         self.threshold = None
         self.explainer = ExplainabilityEngine(self.model, device)
         
+        # Security modules
+        self.use_dp = use_dp
+        self.dp = DifferentialPrivacy(epsilon=dp_epsilon) if use_dp else None
+        self.use_defense = use_defense
+        self.defense = PoisoningDefense() if use_defense else None
+        self.stride = stride
+        
     def set_data(self, X_train, X_test, y_test):
         # X_train: healthy data for training
         tensor_x = torch.Tensor(X_train)
@@ -33,9 +45,6 @@ class EdgeNode:
         
         self.test_data = X_test
         self.test_labels = y_test
-        
-        # Initialize threshold based on initial untrained model (or expected behavior)
-        # Better to initialize after first training round or pre-training.
         
     def train_local(self, epochs: int = 1):
         self.model.train()
@@ -72,7 +81,10 @@ class EdgeNode:
         return self.threshold
 
     def get_parameters(self) -> Dict:
-        return copy.deepcopy(self.model.state_dict())
+        params = copy.deepcopy(self.model.state_dict())
+        if self.use_dp and self.dp:
+            params = self.dp.add_noise(params)
+        return params
 
     def set_parameters(self, parameters: Dict):
         self.model.load_state_dict(parameters)
@@ -84,6 +96,12 @@ class EdgeNode:
         """
         if not peer_params_list:
             return
+
+        if self.use_defense and self.defense:
+            # Filter malicious/anomalous updates
+            peer_params_list = self.defense.filter_updates(self.model.state_dict(), peer_params_list)
+            if not peer_params_list:
+                return
 
         current_params = self.model.state_dict()
         new_params = copy.deepcopy(current_params)
@@ -98,10 +116,11 @@ class EdgeNode:
                 for peer_param in peer_params_list:
                     new_params[key] += peer_param[key] * weight
         else:
-            # Weighted average
-            # Ensure weights sum to 1 (including self weight if handled externally)
-            # For simplicity here, let's assume equal weights for all peers + self
-            pass # TODO: implement explicit weighted avg if needed
+            total_weight = float(sum(weights) + 1.0)
+            for key in new_params.keys():
+                new_params[key] = new_params[key] * (1.0 / total_weight)
+                for w, peer_param in zip(weights, peer_params_list):
+                    new_params[key] += peer_param[key] * (w / total_weight)
             
         self.model.load_state_dict(new_params)
 
@@ -116,7 +135,8 @@ class EdgeNode:
             
         preds = (loss > self.threshold).astype(int)
         metrics = calculate_metrics(self.test_labels, preds)
-        metrics['avg_loss'] = np.mean(loss)
+        metrics['latency'] = MetricsCalculator.compute_detection_latency(self.test_labels, preds, stride=self.stride)
+        metrics['avg_loss'] = float(np.mean(loss))
         return metrics
 
     def explain_sample(self, sample_idx: int):

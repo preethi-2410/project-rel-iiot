@@ -1,66 +1,82 @@
 import torch
-import torch.nn as nn
-import numpy as np
 import shap
+import numpy as np
 
 class ExplainabilityEngine:
-    def __init__(self, model: nn.Module, device: str = 'cpu'):
+    def __init__(self, model, device='cpu'):
         self.model = model
         self.device = device
-        self.model.to(device)
-        self.model.eval()
+        self.explainer = None
+        
+    def prepare_explainer(self, background_data):
+        # background_data: (N, seq_len, features)
+        # Convert to torch
+        data_tensor = torch.FloatTensor(background_data).to(self.device)
+        
+        # Limit background size
+        if len(data_tensor) > 100:
+            indices = np.random.choice(len(data_tensor), 100, replace=False)
+            data_tensor = data_tensor[indices]
+            
+        # Use GradientExplainer
+        try:
+            self.explainer = shap.GradientExplainer(self.model, data_tensor)
+        except Exception as e:
+            print(f"Warning: SHAP init failed: {e}")
+            self.explainer = None
 
-    def get_gradient_attribution(self, x_input: torch.Tensor) -> np.ndarray:
+    def get_gradient_attribution(self, x):
+        x = x.to(self.device)
+        x.requires_grad = True
+        out = self.model(x)
+        grad = torch.autograd.grad(outputs=out.sum(), inputs=x, retain_graph=False)[0]
+        return grad.detach().cpu().numpy()
+
+    def get_shap_attribution(self, x):
+        if self.explainer is None:
+            return None
+        vals = self.explainer.shap_values(x)
+        if isinstance(vals, list):
+            vals = vals[0]
+        return vals
+        
+    def explain(self, instance):
+        # instance: (seq_len, features) or (1, seq_len, features)
+        if self.explainer is None:
+            return None
+            
+        if isinstance(instance, np.ndarray):
+            if len(instance.shape) == 2:
+                instance = instance[np.newaxis, ...]
+            instance_tensor = torch.FloatTensor(instance).to(self.device)
+        else:
+            instance_tensor = instance
+            
+        if not instance_tensor.requires_grad:
+            instance_tensor.requires_grad = True
+        
+        shap_values = self.explainer.shap_values(instance_tensor)
+        
+        return shap_values
+
+    def get_gradient_attribution(self, x):
         """
-        Computes input * gradient of the reconstruction loss w.r.t input.
-        x_input: (1, seq_len, features)
+        Computes gradient-based attribution (Saliency Map).
+        Returns: (seq_len, features) numpy array
         """
-        x = x_input.clone().detach().to(self.device).requires_grad_(True)
+        self.model.eval()
+        if not x.requires_grad:
+            x.requires_grad = True
         
-        # Forward pass
-        x_recon = self.model(x)
+        output = self.model(x)
+        # Loss: reconstruction error (MSE)
+        loss = torch.mean((output - x) ** 2)
         
-        # Compute MSE loss for this sample
-        loss = nn.MSELoss()(x_recon, x)
-        
-        # Backward pass
         self.model.zero_grad()
         loss.backward()
         
-        # Saliency map: |x * grad|
-        # gradients: (1, seq_len, features)
-        gradients = x.grad.data
-        attribution = torch.abs(x * gradients)
-        
-        return attribution.cpu().numpy()
-
-    def get_shap_values(self, x_background: np.ndarray, x_test: np.ndarray, n_samples: int = 50) -> np.ndarray:
-        """
-        Computes SHAP values using KernelExplainer (model agnostic but slow) or GradientExplainer.
-        Since we want to explain the reconstruction error, we need a wrapper.
-        
-        x_background: (N, seq_len, features) - summary background dataset
-        x_test: (1, seq_len, features) - instance to explain
-        """
-        
-        # We define a prediction function that returns the MSE loss per sample
-        def model_loss_wrapper(data_numpy):
-            data_tensor = torch.from_numpy(data_numpy).float().to(self.device)
-            with torch.no_grad():
-                recon = self.model(data_tensor)
-                # Compute MSE per sample, summed over time and features for scalar output?
-                # SHAP expects (n_samples, output_dim). 
-                # If we want to explain "Anomaly Score", output is (n_samples, 1).
-                mse = torch.mean((data_tensor - recon) ** 2, dim=(1, 2))
-                return mse.cpu().numpy().reshape(-1, 1)
-
-        # Use KernelExplainer for flexibility, though GradientExplainer is faster for Torch
-        # But GradientExplainer for Loss function is tricky without custom backward hooks.
-        # Let's stick to a simplified approach or just GradientExplainer on the output if it was a classifier.
-        # For Autoencoder anomaly detection, we want to explain the Loss.
-        
-        explainer = shap.KernelExplainer(model_loss_wrapper, x_background)
-        shap_values = explainer.shap_values(x_test, nsamples=n_samples)
-        
-        return np.array(shap_values)
-
+        # Saliency: |gradient|
+        if x.grad is not None:
+            saliency = x.grad.abs().detach().cpu().numpy()
+            return saliency
+        return np.zeros_like(x.detach().cpu().numpy())

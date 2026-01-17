@@ -10,6 +10,44 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.federated.system import FederatedSimulation
 from src.utils.plotting import plot_convergence, plot_scalability, plot_communication_overhead
+from src.utils.config import load_config, parse_args
+
+def run_from_config(config):
+    print("Running Experiment from Config...")
+    
+    # Extract params
+    fed = config.get('federated', {})
+    net = config.get('network', {})
+    sec = config.get('security', {})
+    data = config.get('data', {})
+    
+    output_dir = config.get('output_dir', 'results')
+    os.makedirs(output_dir, exist_ok=True)
+    
+    sim = FederatedSimulation(
+        num_nodes=fed.get('num_nodes', 5),
+        dataset_name=data.get('dataset_name', 'synthetic'),
+        connectivity=fed.get('connectivity', 'ring'),
+        connectivity_prob=fed.get('connectivity_prob', 0.5),
+        mode=fed.get('mode', 'decentralized'),
+        device=config.get('device', 'cpu'),
+        participation_rate=net.get('participation_rate', 1.0),
+        drop_rate=net.get('drop_rate', 0.0),
+        use_dp=sec.get('use_dp', False),
+        dp_epsilon=sec.get('dp_epsilon', 1.0),
+        use_defense=sec.get('use_defense', False)
+    )
+    
+    history = sim.run_rounds(
+        rounds=fed.get('num_rounds', 10),
+        epochs_per_round=fed.get('epochs_per_round', 1)
+    )
+    
+    # Save results
+    df = pd.DataFrame(history)
+    df.to_csv(os.path.join(output_dir, 'config_experiment_results.csv'), index=False)
+    print(f"Experiment completed. Results in {output_dir}")
+
 
 def run_baseline_comparison(output_dir):
     print("Running Baseline Comparison (Decentralized vs Centralized vs Local)...")
@@ -55,16 +93,20 @@ def run_scalability_study(output_dir):
     print("Scalability study done.")
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--output', type=str, default='results')
-    args = parser.parse_args()
+    args = parse_args()
     
-    os.makedirs(args.output, exist_ok=True)
-    
-    run_baseline_comparison(args.output)
-    run_scalability_study(args.output)
-    
-    print(f"All experiments completed. Results in {args.output}")
+    if args.config:
+        config = load_config(args.config)
+        # Override output dir if provided in args
+        if args.output != 'results':
+            config['output_dir'] = args.output
+        run_from_config(config)
+    else:
+        os.makedirs(args.output, exist_ok=True)
+        run_baseline_comparison(args.output)
+        run_scalability_study(args.output)
+        print(f"All experiments completed. Results in {args.output}")
+
 
 if __name__ == "__main__":
     main()
